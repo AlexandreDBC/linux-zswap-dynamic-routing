@@ -36,7 +36,7 @@ During our memory load tests with the YCSB benchmark and Redis, this new archite
 
 To reproduce this environment and apply the patch to a clean Linux kernel, follow these steps:
 
-**1. Download the target Linux Kernel sources (6.8.12)**
+** Download the target Linux Kernel sources (6.8.12) and apply it**
 ```bash
 wget [https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.8.12.tar.xz](https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.8.12.tar.xz)
 tar -xf linux-6.8.12.tar.xz
