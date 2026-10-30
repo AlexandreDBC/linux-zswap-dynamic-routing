@@ -1,0 +1,1059 @@
+diff --git a/include/linux/page_ext.h b/include/linux/page_ext.h
+index be98564..ddb4f66 100644
+--- a/include/linux/page_ext.h
++++ b/include/linux/page_ext.h
+@@ -40,6 +40,7 @@ enum page_ext_flags {
+ 	PAGE_EXT_YOUNG,
+ 	PAGE_EXT_IDLE,
+ #endif
++	PAGE_EXT_MY_PID,
+ };
+ 
+ /*
+@@ -51,6 +52,9 @@ enum page_ext_flags {
+  */
+ struct page_ext {
+ 	unsigned long flags;
++#ifdef CONFIG_MY_PAGE_EXT
++	pid_t creator_pid;
++#endif
+ };
+ 
+ extern bool early_page_ext;
+diff --git a/mm/Kconfig.debug b/mm/Kconfig.debug
+index 321ab37..d7f02c0 100644
+--- a/mm/Kconfig.debug
++++ b/mm/Kconfig.debug
+@@ -8,6 +8,12 @@ config PAGE_EXTENSION
+ 	  by not allocating this extra memory according to boottime
+ 	  configuration.
+ 
++config MY_PAGE_EXT
++	bool "Enable my custom page_ext creator_pid field"
++	depends on PAGE_EXTENSION
++	default y
++	help
++	  Enables tracking of the PID that created a page using the page_ext mechanism.
+ config DEBUG_PAGEALLOC
+ 	bool "Debug page memory allocations"
+ 	depends on DEBUG_KERNEL
+diff --git a/mm/memory.c b/mm/memory.c
+index 296e4f0..4dbfd4f 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -78,6 +78,7 @@
+ #include <linux/ptrace.h>
+ #include <linux/vmalloc.h>
+ #include <linux/sched/sysctl.h>
++#include <linux/page_ext.h>
+ 
+ #include <trace/events/kmem.h>
+ 
+@@ -4295,6 +4296,11 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 	if (!folio)
+ 		goto oom;
+ 
++	struct page_ext* pe = page_ext_get(&folio->page);
++	if (pe && test_bit(PAGE_EXT_MY_PID, &pe->flags))
++		WRITE_ONCE(pe->creator_pid, current->pid);
++	page_ext_put(pe);
++
+ 	nr_pages = folio_nr_pages(folio);
+ 	addr = ALIGN_DOWN(vmf->address, nr_pages * PAGE_SIZE);
+ 
+@@ -4302,6 +4308,8 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 		goto oom_free_page;
+ 	folio_throttle_swaprate(folio, GFP_KERNEL);
+ 
++
++
+ 	/*
+ 	 * The memory barrier inside __folio_mark_uptodate makes sure that
+ 	 * preceding stores to the page contents become visible before
+diff --git a/mm/page_ext.c b/mm/page_ext.c
+index 4548fcc..65eff80 100644
+--- a/mm/page_ext.c
++++ b/mm/page_ext.c
+@@ -64,6 +64,20 @@
+ #define PAGE_EXT_INVALID       (0x1)
+ #endif
+ 
++#ifdef CONFIG_MY_PAGE_EXT
++
++static bool my_page_ext_need(void)
++{
++	return true;
++}
++
++static struct page_ext_operations my_page_ext_ops = {
++	.need = my_page_ext_need,
++	.need_shared_flags = true,
++};
++
++#endif
++
+ #if defined(CONFIG_PAGE_IDLE_FLAG) && !defined(CONFIG_64BIT)
+ static bool need_page_idle(void)
+ {
+@@ -82,6 +96,9 @@ static struct page_ext_operations *page_ext_ops[] __initdata = {
+ #if defined(CONFIG_PAGE_IDLE_FLAG) && !defined(CONFIG_64BIT)
+ 	&page_idle_ops,
+ #endif
++#ifdef CONFIG_MY_PAGE_EXT
++	&my_page_ext_ops,
++#endif
+ #ifdef CONFIG_PAGE_TABLE_CHECK
+ 	&page_table_check_ops,
+ #endif
+@@ -477,6 +494,31 @@ void __init page_ext_init(void)
+ 	}
+ 	hotplug_memory_notifier(page_ext_callback, DEFAULT_CALLBACK_PRI);
+ 	pr_info("allocated %ld bytes of page_ext\n", total_usage);
++#ifdef CONFIG_MY_PAGE_EXT
++	for_each_node_state(nid, N_MEMORY) {
++		unsigned long start_pfn, end_pfn;
++		unsigned long pfn;
++
++		start_pfn = node_start_pfn(nid);
++		end_pfn = node_end_pfn(nid);
++
++		for (pfn = start_pfn; pfn < end_pfn; pfn++) {
++			struct page* page;
++			struct page_ext* pe;
++
++			if (!pfn_valid(pfn))
++				continue;
++
++			page = pfn_to_page(pfn);
++			pe = lookup_page_ext(page);
++			if (!pe)
++				continue;
++
++			set_bit(PAGE_EXT_MY_PID, &pe->flags);
++			pe->creator_pid = -1;
++		}
++	}
++#endif
+ 	invoke_init_callbacks();
+ 	return;
+ 
+@@ -532,3 +574,4 @@ void page_ext_put(struct page_ext *page_ext)
+ 
+ 	rcu_read_unlock();
+ }
++
+diff --git a/mm/zswap.c b/mm/zswap.c
+index 69766f2..9165521 100644
+--- a/mm/zswap.c
++++ b/mm/zswap.c
+@@ -36,6 +36,9 @@
+ #include <linux/pagemap.h>
+ #include <linux/workqueue.h>
+ #include <linux/list_lru.h>
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
++#include <linux/page_ext.h>
+ 
+ #include "swap.h"
+ #include "internal.h"
+@@ -84,6 +87,18 @@ static bool zswap_pool_reached_full;
+ **********************************/
+ 
+ #define ZSWAP_PARAM_UNSET ""
++#define ZSWAP_LOG_CAPACITY 1024
++#define MAX_ALGO_CAPACITY 2
++#define NB_USING_ALGO 2
++
++/* Per-page compressor selection */
++enum zswap_comp_id {
++	ZSWAP_COMP_LZO = 0,
++	ZSWAP_COMP_ZSTD = 1,
++};
++
++static unsigned int comp_score_thresh = 1500;
++module_param_named(comp_thresh, comp_score_thresh, uint, 0644);
+ 
+ static int zswap_setup(void);
+ 
+@@ -161,15 +176,19 @@ bool is_zswap_enabled(void)
+ /*********************************
+ * data structures
+ **********************************/
+-
++// "kit de travil" pour chaque algo dans chaque cpu
+ struct crypto_acomp_ctx {
+-	struct crypto_acomp *acomp;
+-	struct acomp_req *req;
+-	struct crypto_wait wait;
+-	u8 *buffer;
+-	struct mutex mutex;
++	struct crypto_acomp *acomp; // Pointeur vers le moteur de l'algorithme (ex: ZSTD, LZO) alloué via l'API Crypto du noyau.
++	struct acomp_req *req; // Structure contenant les paramètres de l'opération en cours (adresse source, destination, tailles).
++	struct crypto_wait wait; // Mécanisme de synchronisation pour mettre le thread en sommeil en attendant la fin de la compression.
++	u8 *buffer; // Zone de mémoire tampon temporaire (de la taille d'une page) où est écrit le résultat compressé.
++	struct mutex mutex; // Verrou exclusif garantissant qu'un seul thread à la fois utilise CE "kit de travail" sur le CPU.
+ };
+ 
++struct zswap_acomp_set {
++    struct crypto_acomp_ctx acomp_ctx[MAX_ALGO_CAPACITY];
++};
++ 
+ /*
+  * The lock ordering is zswap_tree.lock -> zswap_pool.lru_lock.
+  * The only case where lru_lock is not acquired while holding tree.lock is
+@@ -177,18 +196,18 @@ struct crypto_acomp_ctx {
+  * needs to be verified that it's still valid in the tree.
+  */
+ struct zswap_pool {
+-	struct zpool *zpools[ZSWAP_NR_ZPOOLS];
+-	struct crypto_acomp_ctx __percpu *acomp_ctx;
+-	struct kref kref;
+-	struct list_head list;
+-	struct work_struct release_work;
+-	struct work_struct shrink_work;
+-	struct hlist_node node;
+-	char tfm_name[CRYPTO_MAX_ALG_NAME];
+-	struct list_lru list_lru;
+-	struct mem_cgroup *next_shrink;
+-	struct shrinker *shrinker;
+-	atomic_t nr_stored;
++	struct zpool *zpools[ZSWAP_NR_ZPOOLS]; // Des sortes de pool dans la pool géant pour toute la ram, cela permet d'avoir une pool par cpu, ces pools per cpu sont englobés par là pool qui englobe tout la ram
++	struct zswap_acomp_set __percpu *acomp_ctx_set; // Ensemble des kits de travail pour chaque algo dans chaque CPU 
++	struct kref kref; // compteur de réf, une sécurité du noyau qui à chaque utilisation par un composant est incrémenté et quand l'utilisation termine cela décrémente ce compteur
++	struct list_head list; // Tête de liste des pools
++	struct work_struct release_work; // Au moment du changement d'algo ( dans le système de base ) il détruit la pool quand kref atteint 0
++	struct work_struct shrink_work; // détecte les débordement de seuil maximum de la ram et va appeler le shrinker pour libérer de la ram
++	struct hlist_node node; // L'indexation dans la table de hachage
++	char tfm_name[NB_USING_ALGO][CRYPTO_MAX_ALG_NAME]; // Initialement, nom de l'algo qui est utilisé par le système.
++	struct list_lru list_lru; // Le classement d'ancienneté des pages de la pool.
++	struct mem_cgroup *next_shrink; // Le pointeur de ciblage pour les conteneurs
++	struct shrinker *shrinker; // Le "Moniteur" officiel de la pool auprès du noyau
++	atomic_t nr_stored; // Le compteur en temps réel du nombre de pages stockées
+ };
+ 
+ /*
+@@ -226,6 +245,7 @@ struct zswap_entry {
+ 	};
+ 	struct obj_cgroup *objcg;
+ 	struct list_head lru;
++	u8 comp_id;			/* 0 = LZO, 1 = ZSTD */
+ };
+ 
+ /*
+@@ -261,6 +281,18 @@ static DEFINE_MUTEX(zswap_init_lock);
+ /* init completed, but couldn't create the initial pool */
+ static bool zswap_has_pool;
+ 
++struct zswap_log_entry {
++	u64 cycles_score;
++	u64 cycles_comp;
++	u32 comp_len;
++	int comp_score;
++	u8 algo;
++	pid_t creator_pid;
++};
++
++static struct zswap_log_entry zswap_log_buff[ZSWAP_LOG_CAPACITY];
++static atomic_t zswap_log_index = ATOMIC_INIT(0);
++
+ /*********************************
+ * helpers and fwd declarations
+ **********************************/
+@@ -313,6 +345,8 @@ static void zswap_update_total_size(void)
+ 	zswap_pool_total_size = total;
+ }
+ 
++static int comp_score(u8* page_data);
++
+ /* should be called under RCU */
+ #ifdef CONFIG_MEMCG
+ static inline struct mem_cgroup *mem_cgroup_from_entry(struct zswap_entry *entry)
+@@ -356,9 +390,10 @@ static struct zswap_entry *zswap_entry_cache_alloc(gfp_t gfp, int nid)
+ 	if (!entry)
+ 		return NULL;
+ 	entry->refcount = 1;
++	entry->comp_id = ZSWAP_COMP_LZO; /* default */
+ 	RB_CLEAR_NODE(&entry->rbnode);
+ 	return entry;
+-}
++}	
+ 
+ static void zswap_entry_cache_free(struct zswap_entry *entry)
+ {
+@@ -708,67 +743,80 @@ static void zswap_alloc_shrinker(struct zswap_pool *pool)
+ /*********************************
+ * per-cpu code
+ **********************************/
++// Préparateur de kit
+ static int zswap_cpu_comp_prepare(unsigned int cpu, struct hlist_node *node)
+ {
+ 	struct zswap_pool *pool = hlist_entry(node, struct zswap_pool, node);
+-	struct crypto_acomp_ctx *acomp_ctx = per_cpu_ptr(pool->acomp_ctx, cpu);
+-	struct crypto_acomp *acomp;
+-	struct acomp_req *req;
+-	int ret;
++	struct zswap_acomp_set *acomp_ctx_set = per_cpu_ptr(pool->acomp_ctx_set, cpu);
++	int i, ret;
++	for ( i = 0; i < NB_USING_ALGO; i ++) {
++		struct crypto_acomp_ctx *acomp_ctx = &acomp_ctx_set->acomp_ctx[i];
++		struct crypto_acomp *acomp;
++		struct acomp_req *req;
++
++		mutex_init(&acomp_ctx->mutex);
++
++		acomp_ctx->buffer = kmalloc_node(PAGE_SIZE * 2, GFP_KERNEL, cpu_to_node(cpu));
++		if (!acomp_ctx->buffer) {
++			ret = -ENOMEM;
++            goto fail;
++		}
+ 
+-	mutex_init(&acomp_ctx->mutex);
++		acomp = crypto_alloc_acomp_node(pool->tfm_name[i], 0, 0, cpu_to_node(cpu));
++		if (IS_ERR(acomp)) {
++			pr_err("could not alloc crypto acomp %s : %ld\n",
++					pool->tfm_name[i], PTR_ERR(acomp));
++			ret = PTR_ERR(acomp);
++			kfree(acomp_ctx->buffer);
++			goto fail;
++		}
++		acomp_ctx->acomp = acomp;
+ 
+-	acomp_ctx->buffer = kmalloc_node(PAGE_SIZE * 2, GFP_KERNEL, cpu_to_node(cpu));
+-	if (!acomp_ctx->buffer)
+-		return -ENOMEM;
++		req = acomp_request_alloc(acomp_ctx->acomp);
++		if (!req) {
++			pr_err("could not alloc crypto acomp_request %s\n",
++				pool->tfm_name[i]);
++			crypto_free_acomp(acomp_ctx->acomp);
++			kfree(acomp_ctx->buffer);
++			ret = -ENOMEM;
++			goto fail;	
++		}
++		acomp_ctx->req = req;
+ 
+-	acomp = crypto_alloc_acomp_node(pool->tfm_name, 0, 0, cpu_to_node(cpu));
+-	if (IS_ERR(acomp)) {
+-		pr_err("could not alloc crypto acomp %s : %ld\n",
+-				pool->tfm_name, PTR_ERR(acomp));
+-		ret = PTR_ERR(acomp);
+-		goto acomp_fail;
+-	}
+-	acomp_ctx->acomp = acomp;
+-
+-	req = acomp_request_alloc(acomp_ctx->acomp);
+-	if (!req) {
+-		pr_err("could not alloc crypto acomp_request %s\n",
+-		       pool->tfm_name);
+-		ret = -ENOMEM;
+-		goto req_fail;
++		crypto_init_wait(&acomp_ctx->wait);
++		/*
++		* if the backend of acomp is async zip, crypto_req_done() will wakeup
++		* crypto_wait_req(); if the backend of acomp is scomp, the callback
++		* won't be called, crypto_wait_req() will return without blocking.
++		*/
++		acomp_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
++					crypto_req_done, &acomp_ctx->wait);
+ 	}
+-	acomp_ctx->req = req;
+-
+-	crypto_init_wait(&acomp_ctx->wait);
+-	/*
+-	 * if the backend of acomp is async zip, crypto_req_done() will wakeup
+-	 * crypto_wait_req(); if the backend of acomp is scomp, the callback
+-	 * won't be called, crypto_wait_req() will return without blocking.
+-	 */
+-	acomp_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+-				   crypto_req_done, &acomp_ctx->wait);
+-
+ 	return 0;
+-
+-req_fail:
+-	crypto_free_acomp(acomp_ctx->acomp);
+-acomp_fail:
+-	kfree(acomp_ctx->buffer);
+-	return ret;
++		
++fail:
++    while (--i >= 0) {
++        struct crypto_acomp_ctx *failed_ctx = &acomp_ctx_set->acomp_ctx[i];
++        acomp_request_free(failed_ctx->req);
++        crypto_free_acomp(failed_ctx->acomp);
++        kfree(failed_ctx->buffer);
++    }
++    return ret;
+ }
+ 
+ static int zswap_cpu_comp_dead(unsigned int cpu, struct hlist_node *node)
+ {
+ 	struct zswap_pool *pool = hlist_entry(node, struct zswap_pool, node);
+-	struct crypto_acomp_ctx *acomp_ctx = per_cpu_ptr(pool->acomp_ctx, cpu);
+-
+-	if (!IS_ERR_OR_NULL(acomp_ctx)) {
+-		if (!IS_ERR_OR_NULL(acomp_ctx->req))
+-			acomp_request_free(acomp_ctx->req);
+-		if (!IS_ERR_OR_NULL(acomp_ctx->acomp))
+-			crypto_free_acomp(acomp_ctx->acomp);
+-		kfree(acomp_ctx->buffer);
++	struct zswap_acomp_set *acomp_ctx_set = per_cpu_ptr(pool->acomp_ctx_set, cpu);
++	for ( int i = 0; i < NB_USING_ALGO; i ++) {
++		struct crypto_acomp_ctx *acomp_ctx = &acomp_ctx_set->acomp_ctx[i];
++		if (!IS_ERR_OR_NULL(acomp_ctx)) {
++			if (!IS_ERR_OR_NULL(acomp_ctx->req))
++				acomp_request_free(acomp_ctx->req);
++			if (!IS_ERR_OR_NULL(acomp_ctx->acomp))
++				crypto_free_acomp(acomp_ctx->acomp);
++			kfree(acomp_ctx->buffer);
++		}
+ 	}
+ 
+ 	return 0;
+@@ -835,18 +883,27 @@ static struct zswap_pool *zswap_pool_find_get(char *type, char *compressor)
+ 	struct zswap_pool *pool;
+ 
+ 	assert_spin_locked(&zswap_pools_lock);
+-
+ 	list_for_each_entry_rcu(pool, &zswap_pools, list) {
+-		if (strcmp(pool->tfm_name, compressor))
+-			continue;
+-		/* all zpools share the same type */
+-		if (strcmp(zpool_get_type(pool->zpools[0]), type))
+-			continue;
+-		/* if we can't get it, it's about to be destroyed */
+-		if (!zswap_pool_get(pool))
+-			continue;
+-		return pool;
+-	}
++        bool algo_match = false;
++        int i;
++
++        for (i = 0; i < NB_USING_ALGO; i++) {
++            if (strcmp(pool->tfm_name[i], compressor) == 0) {
++                algo_match = true;
++                break;
++            }
++        }
++
++        if (!algo_match)
++            continue;
++
++        if (strcmp(zpool_get_type(pool->zpools[0]), type))
++            continue;
++        if (!zswap_pool_get(pool))
++            continue;
++        
++        return pool;
++    }
+ 
+ 	return NULL;
+ }
+@@ -1061,10 +1118,11 @@ static struct zswap_pool *zswap_pool_create(char *type, char *compressor)
+ 	}
+ 	pr_debug("using %s zpool\n", zpool_get_type(pool->zpools[0]));
+ 
+-	strscpy(pool->tfm_name, compressor, sizeof(pool->tfm_name));
++	strscpy(pool->tfm_name[0], "lzo", CRYPTO_MAX_ALG_NAME);
++    strscpy(pool->tfm_name[1], "zstd", CRYPTO_MAX_ALG_NAME);
+ 
+-	pool->acomp_ctx = alloc_percpu(*pool->acomp_ctx);
+-	if (!pool->acomp_ctx) {
++	pool->acomp_ctx_set = alloc_percpu(*pool->acomp_ctx_set);
++	if (!pool->acomp_ctx_set) {
+ 		pr_err("percpu alloc failed\n");
+ 		goto error;
+ 	}
+@@ -1078,7 +1136,8 @@ static struct zswap_pool *zswap_pool_create(char *type, char *compressor)
+ 	if (!pool->shrinker)
+ 		goto error;
+ 
+-	pr_debug("using %s compressor\n", pool->tfm_name);
++	pr_debug("using %s compressor\n", pool->tfm_name[0]);
++	pr_debug("using %s compressor\n", pool->tfm_name[1]);
+ 
+ 	/* being the current pool takes 1 ref; this func expects the
+ 	 * caller to always add the new pool as the current pool
+@@ -1099,8 +1158,8 @@ static struct zswap_pool *zswap_pool_create(char *type, char *compressor)
+ 	list_lru_destroy(&pool->list_lru);
+ 	shrinker_free(pool->shrinker);
+ error:
+-	if (pool->acomp_ctx)
+-		free_percpu(pool->acomp_ctx);
++	if (pool->acomp_ctx_set)
++		free_percpu(pool->acomp_ctx_set);
+ 	while (i--)
+ 		zpool_destroy_pool(pool->zpools[i]);
+ 	kfree(pool);
+@@ -1157,7 +1216,7 @@ static void zswap_pool_destroy(struct zswap_pool *pool)
+ 
+ 	shrinker_free(pool->shrinker);
+ 	cpuhp_state_remove_instance(CPUHP_MM_ZSWP_POOL_PREPARE, &pool->node);
+-	free_percpu(pool->acomp_ctx);
++	free_percpu(pool->acomp_ctx_set);
+ 	list_lru_destroy(&pool->list_lru);
+ 
+ 	spin_lock(&zswap_pools_lock);
+@@ -1375,10 +1434,11 @@ static void __zswap_load(struct zswap_entry *entry, struct page *page)
+ {
+ 	struct zpool *zpool = zswap_find_zpool(entry);
+ 	struct scatterlist input, output;
+-	struct crypto_acomp_ctx *acomp_ctx;
+ 	u8 *src;
+ 
+-	acomp_ctx = raw_cpu_ptr(entry->pool->acomp_ctx);
++	struct zswap_acomp_set *acomp_ctx_set = raw_cpu_ptr(entry->pool->acomp_ctx_set);
++	struct crypto_acomp_ctx *acomp_ctx = &acomp_ctx_set->acomp_ctx[entry->comp_id];
++
+ 	mutex_lock(&acomp_ctx->mutex);
+ 
+ 	src = zpool_map_handle(zpool, entry->handle, ZPOOL_MM_RO);
+@@ -1400,6 +1460,7 @@ static void __zswap_load(struct zswap_entry *entry, struct page *page)
+ 		zpool_unmap_handle(zpool, entry->handle);
+ }
+ 
++
+ /*********************************
+ * writeback code
+ **********************************/
+@@ -1412,12 +1473,12 @@ static void __zswap_load(struct zswap_entry *entry, struct page *page)
+  * to the swap device.  We are basically resuming the same swap
+  * writeback path that was intercepted with the zswap_store()
+  * in the first place.  After the folio has been decompressed into
+- * the swap cache, the compressed version stored by zswap can be
++ * the swap cache, the compressed version stored by zswap can bee
+  * freed.
+  */
+ static int zswap_writeback_entry(struct zswap_entry *entry,
+ 				 struct zswap_tree *tree)
+-{
++{	
+ 	swp_entry_t swpentry = entry->swpentry;
+ 	struct folio *folio;
+ 	struct mempolicy *mpol;
+@@ -1505,227 +1566,317 @@ static void zswap_fill_page(void *ptr, unsigned long value)
+ 	memset_l(page, value, PAGE_SIZE / sizeof(unsigned long));
+ }
+ 
+-bool zswap_store(struct folio *folio)
+-{
+-	swp_entry_t swp = folio->swap;
+-	int type = swp_type(swp);
+-	pgoff_t offset = swp_offset(swp);
+-	struct page *page = &folio->page;
+-	struct zswap_tree *tree = zswap_trees[type];
+-	struct zswap_entry *entry, *dupentry;
+-	struct scatterlist input, output;
+-	struct crypto_acomp_ctx *acomp_ctx;
+-	struct obj_cgroup *objcg = NULL;
+-	struct mem_cgroup *memcg = NULL;
+-	struct zswap_pool *pool;
+-	struct zpool *zpool;
+-	unsigned int dlen = PAGE_SIZE;
+-	unsigned long handle, value;
+-	char *buf;
+-	u8 *src, *dst;
+-	gfp_t gfp;
+-	int ret;
+-
+-	VM_WARN_ON_ONCE(!folio_test_locked(folio));
+-	VM_WARN_ON_ONCE(!folio_test_swapcache(folio));
+-
+-	/* Large folios aren't supported */
+-	if (folio_test_large(folio))
+-		return false;
+-
+-	if (!tree)
+-		return false;
+-
+-	/*
+-	 * If this is a duplicate, it must be removed before attempting to store
+-	 * it, otherwise, if the store fails the old page won't be removed from
+-	 * the tree, and it might be written back overriding the new data.
+-	 */
+-	spin_lock(&tree->lock);
+-	dupentry = zswap_rb_search(&tree->rbroot, offset);
+-	if (dupentry) {
+-		zswap_duplicate_entry++;
+-		zswap_invalidate_entry(tree, dupentry);
+-	}
+-	spin_unlock(&tree->lock);
+-
+-	if (!zswap_enabled)
+-		return false;
+-
+-	objcg = get_obj_cgroup_from_folio(folio);
+-	if (objcg && !obj_cgroup_may_zswap(objcg)) {
+-		memcg = get_mem_cgroup_from_objcg(objcg);
+-		if (shrink_memcg(memcg)) {
+-			mem_cgroup_put(memcg);
+-			goto reject;
+-		}
+-		mem_cgroup_put(memcg);
+-	}
+-
+-	/* reclaim space if needed */
+-	if (zswap_is_full()) {
+-		zswap_pool_limit_hit++;
+-		zswap_pool_reached_full = true;
+-		goto shrink;
+-	}
+-
+-	if (zswap_pool_reached_full) {
+-	       if (!zswap_can_accept())
+-			goto shrink;
+-		else
+-			zswap_pool_reached_full = false;
+-	}
++static int comp_score(u8* page_data) {
++	int entropy_proxy = 0;
++	u16 hist[256] = {0};
+ 
+-	/* allocate entry */
+-	entry = zswap_entry_cache_alloc(GFP_KERNEL, page_to_nid(page));
+-	if (!entry) {
+-		zswap_reject_kmemcache_fail++;
+-		goto reject;
++	// Count occurrences of unique values
++	for (int pos = 0; pos < 512; pos++) {
++		hist[page_data[pos]]++;
+ 	}
+ 
+-	if (zswap_same_filled_pages_enabled) {
+-		src = kmap_local_page(page);
+-		if (zswap_is_page_same_filled(src, &value)) {
+-			kunmap_local(src);
+-			entry->swpentry = swp_entry(type, offset);
+-			entry->length = 0;
+-			entry->value = value;
+-			atomic_inc(&zswap_same_filled_pages);
+-			goto insert_entry;
++	// Compute the proxy of entropy
++	for (int i = 0; i < 256; i++) {
++		if (hist[i] != 0) {
++			entropy_proxy += hist[i] * ilog2(hist[i]);
+ 		}
+-		kunmap_local(src);
+ 	}
+ 
+-	if (!zswap_non_same_filled_pages_enabled)
+-		goto freepage;
++	return entropy_proxy;
++}
+ 
+-	/* if entry is successfully added, it keeps the reference */
+-	entry->pool = zswap_pool_current_get();
+-	if (!entry->pool)
+-		goto freepage;
++bool zswap_compress_page(struct folio *folio, struct zswap_entry *entry,
++                         u8 algo_idx, int comp_score, u64 delta_score)
++{
++    struct crypto_acomp_ctx *acomp_ctx;
++    struct zswap_acomp_set *acomp_ctx_set;
++    struct scatterlist input, output;
++    unsigned int dlen = PAGE_SIZE;
++    unsigned long handle;
++    struct zpool *zpool;
++    gfp_t gfp;
++    char *buf;
++    u8 *dst;
++    int ret;
++    u64 start_cycles, end_cycles;
++
++    acomp_ctx_set = raw_cpu_ptr(entry->pool->acomp_ctx_set);
++    acomp_ctx = &acomp_ctx_set->acomp_ctx[algo_idx];
++
++    mutex_lock(&acomp_ctx->mutex);
++
++    dst = acomp_ctx->buffer;
++    sg_init_table(&input, 1);
++    sg_set_page(&input, &folio->page, PAGE_SIZE, 0);
++
++    sg_init_one(&output, dst, PAGE_SIZE * 2);
++    acomp_request_set_params(acomp_ctx->req, &input, &output, PAGE_SIZE, dlen);
++
++    /* Mesure du temps de compression */
++    start_cycles = get_cycles();
++    ret = crypto_wait_req(crypto_acomp_compress(acomp_ctx->req), &acomp_ctx->wait);
++    end_cycles = get_cycles();
++
++    dlen = acomp_ctx->req->dlen;
++
++    if (ret) {
++        zswap_reject_compress_fail++;
++        goto put_dstmem;
++    }
++
++    /* store */
++    zpool = zswap_find_zpool(entry);
++    gfp = __GFP_NORETRY | __GFP_NOWARN | __GFP_KSWAPD_RECLAIM;
++    if (zpool_malloc_support_movable(zpool))
++        gfp |= __GFP_HIGHMEM | __GFP_MOVABLE;
++
++    ret = zpool_malloc(zpool, dlen, gfp, &handle);
++    if (ret == -ENOSPC) {
++        zswap_reject_compress_poor++;
++        goto put_dstmem;
++    }
++    if (ret) {
++        zswap_reject_alloc_fail++;
++        goto put_dstmem;
++    }
++
++    buf = zpool_map_handle(zpool, handle, ZPOOL_MM_WO);
++    memcpy(buf, dst, dlen);
++    zpool_unmap_handle(zpool, handle);
++
++    entry->handle = handle;
++    entry->length = dlen;
++    entry->comp_id = algo_idx;
++
++	int i = atomic_fetch_add(1, &zswap_log_index) % ZSWAP_LOG_CAPACITY;
++    zswap_log_buff[i].cycles_score = delta_score;
++    zswap_log_buff[i].cycles_comp  = end_cycles - start_cycles;
++    zswap_log_buff[i].comp_len     = dlen;
++    zswap_log_buff[i].comp_score   = comp_score;
++    zswap_log_buff[i].algo         = algo_idx;
++    zswap_log_buff[i].creator_pid  = -1;
++
++    mutex_unlock(&acomp_ctx->mutex);
++    return true;
+ 
+-	if (objcg) {
+-		memcg = get_mem_cgroup_from_objcg(objcg);
+-		if (memcg_list_lru_alloc(memcg, &entry->pool->list_lru, GFP_KERNEL)) {
+-			mem_cgroup_put(memcg);
+-			goto put_pool;
+-		}
+-		mem_cgroup_put(memcg);
+-	}
++put_dstmem:
++    mutex_unlock(&acomp_ctx->mutex);
++    return false;
++}
+ 
+-	/* compress */
+-	acomp_ctx = raw_cpu_ptr(entry->pool->acomp_ctx);
++bool zswap_store(struct folio *folio)
++{
++    swp_entry_t swp = folio->swap;
++    int type = swp_type(swp);
++    pgoff_t offset = swp_offset(swp);
++    struct page *page = &folio->page;
++    struct zswap_tree *tree = zswap_trees[type];
++    struct zswap_entry *entry, *dupentry;
++    struct obj_cgroup *objcg = NULL;
++    struct mem_cgroup *memcg = NULL;
++    struct zswap_pool *pool;
++    unsigned long value;
++    u8 *src;
++    u8 algo_idx; 
++
++    VM_WARN_ON_ONCE(!folio_test_locked(folio));
++    VM_WARN_ON_ONCE(!folio_test_swapcache(folio));
++
++    /* Large folios aren't supported */
++    if (folio_test_large(folio))
++        return false;
++
++    if (!tree)
++        return false;
++
++    spin_lock(&tree->lock);
++    dupentry = zswap_rb_search(&tree->rbroot, offset);
++    if (dupentry) {
++        zswap_duplicate_entry++;
++        zswap_invalidate_entry(tree, dupentry);
++    }
++    spin_unlock(&tree->lock);
++
++    if (!zswap_enabled)
++        return false;
++
++    objcg = get_obj_cgroup_from_folio(folio);
++    if (objcg && !obj_cgroup_may_zswap(objcg)) {
++        memcg = get_mem_cgroup_from_objcg(objcg);
++        if (shrink_memcg(memcg)) {
++            mem_cgroup_put(memcg);
++            goto reject;
++        }
++        mem_cgroup_put(memcg);
++    }
++
++    /* reclaim space if needed */
++    if (zswap_is_full()) {
++        zswap_pool_limit_hit++;
++        zswap_pool_reached_full = true;
++        goto shrink;
++    }
++
++    if (zswap_pool_reached_full) {
++           if (!zswap_can_accept())
++            goto shrink;
++        else
++            zswap_pool_reached_full = false;
++    }
++
++    /* allocate entry */
++    entry = zswap_entry_cache_alloc(GFP_KERNEL, page_to_nid(page));
++    if (!entry) {
++        zswap_reject_kmemcache_fail++;
++        goto reject;
++    }
++
++    if (zswap_same_filled_pages_enabled) {
++        src = kmap_local_page(page);
++        if (zswap_is_page_same_filled(src, &value)) {
++            kunmap_local(src);
++            entry->swpentry = swp_entry(type, offset);
++            entry->length = 0;
++            entry->value = value;
++            atomic_inc(&zswap_same_filled_pages);
++            goto insert_entry;
++        }
++        kunmap_local(src);
++    }
++
++    if (!zswap_non_same_filled_pages_enabled)
++        goto freepage;
++
++    /* if entry is successfully added, it keeps the reference */
++    entry->pool = zswap_pool_current_get();
++    if (!entry->pool)
++        goto freepage;
++
++    if (objcg) {
++        memcg = get_mem_cgroup_from_objcg(objcg);
++        if (memcg_list_lru_alloc(memcg, &entry->pool->list_lru, GFP_KERNEL)) {
++            mem_cgroup_put(memcg);
++            goto put_pool;
++        }
++        mem_cgroup_put(memcg);
++    }
++        
++    u64 start_cycles_score = get_cycles();
++    u8* page_data = (u8*)kmap_local_page(&folio->page);
++    int estimate_compressibility = comp_score(page_data);
++    kunmap_local(page_data);
++    u64 end_cycles_score = get_cycles();
++    
++    u64 delta_score = end_cycles_score - start_cycles_score;
++
++    if(estimate_compressibility < comp_score_thresh) {
++        algo_idx = 0;
++    } else {
++        algo_idx = 1;
++    }
++
++    if (!zswap_compress_page(folio, entry, algo_idx,estimate_compressibility, delta_score))
++        goto put_pool; 
++
++    /* populate entry */
++    entry->swpentry = swp_entry(type, offset);
+ 
+-	mutex_lock(&acomp_ctx->mutex);
++insert_entry:
++    entry->objcg = objcg;
++    if (objcg) {
++        obj_cgroup_charge_zswap(objcg, entry->length);
++        count_objcg_event(objcg, ZSWPOUT);
++    }
++
++    /* map */
++    spin_lock(&tree->lock);
++    while (zswap_rb_insert(&tree->rbroot, entry, &dupentry) == -EEXIST) {
++        WARN_ON(1);
++        zswap_duplicate_entry++;
++        zswap_invalidate_entry(tree, dupentry);
++    }
++    if (entry->length) {
++        INIT_LIST_HEAD(&entry->lru);
++        zswap_lru_add(&entry->pool->list_lru, entry);
++        atomic_inc(&entry->pool->nr_stored);
++    }
++    spin_unlock(&tree->lock);
++
++    /* update stats */
++    atomic_inc(&zswap_stored_pages);
++    zswap_update_total_size();
++    count_vm_event(ZSWPOUT);
++
++    return true;
+ 
+-	dst = acomp_ctx->buffer;
+-	sg_init_table(&input, 1);
+-	sg_set_page(&input, &folio->page, PAGE_SIZE, 0);
++put_pool:
++    zswap_pool_put(entry->pool);
++freepage:
++    zswap_entry_cache_free(entry);
++reject:
++    if (objcg)
++        obj_cgroup_put(objcg);
++    return false;
+ 
+-	/*
+-	 * We need PAGE_SIZE * 2 here since there maybe over-compression case,
+-	 * and hardware-accelerators may won't check the dst buffer size, so
+-	 * giving the dst buffer with enough length to avoid buffer overflow.
+-	 */
+-	sg_init_one(&output, dst, PAGE_SIZE * 2);
+-	acomp_request_set_params(acomp_ctx->req, &input, &output, PAGE_SIZE, dlen);
+-	/*
+-	 * it maybe looks a little bit silly that we send an asynchronous request,
+-	 * then wait for its completion synchronously. This makes the process look
+-	 * synchronous in fact.
+-	 * Theoretically, acomp supports users send multiple acomp requests in one
+-	 * acomp instance, then get those requests done simultaneously. but in this
+-	 * case, zswap actually does store and load page by page, there is no
+-	 * existing method to send the second page before the first page is done
+-	 * in one thread doing zwap.
+-	 * but in different threads running on different cpu, we have different
+-	 * acomp instance, so multiple threads can do (de)compression in parallel.
+-	 */
+-	ret = crypto_wait_req(crypto_acomp_compress(acomp_ctx->req), &acomp_ctx->wait);
+-	dlen = acomp_ctx->req->dlen;
++shrink:
++    pool = zswap_pool_last_get();
++    if (pool && !queue_work(shrink_wq, &pool->shrink_work))
++        zswap_pool_put(pool);
++    goto reject;
++}
+ 
+-	if (ret) {
+-		zswap_reject_compress_fail++;
+-		goto put_dstmem;
+-	}
++static int zswap_log_show(struct seq_file *m, void *v)
++{
++	int i;
+ 
+-	/* store */
+-	zpool = zswap_find_zpool(entry);
+-	gfp = __GFP_NORETRY | __GFP_NOWARN | __GFP_KSWAPD_RECLAIM;
+-	if (zpool_malloc_support_movable(zpool))
+-		gfp |= __GFP_HIGHMEM | __GFP_MOVABLE;
+-	ret = zpool_malloc(zpool, dlen, gfp, &handle);
+-	if (ret == -ENOSPC) {
+-		zswap_reject_compress_poor++;
+-		goto put_dstmem;
+-	}
+-	if (ret) {
+-		zswap_reject_alloc_fail++;
+-		goto put_dstmem;
++	for (i = 0; i < ZSWAP_LOG_CAPACITY; i++) {
++		const struct zswap_log_entry *e = &zswap_log_buff[i];
++		if (e->comp_len == 0)
++			continue;
++		seq_printf(m, "%llu,%llu,%u,%d,%d,%d\n", e->cycles_score, e->cycles_comp, e->comp_len, e->comp_score, e->algo, e->creator_pid);
+ 	}
+-	buf = zpool_map_handle(zpool, handle, ZPOOL_MM_WO);
+-	memcpy(buf, dst, dlen);
+-	zpool_unmap_handle(zpool, handle);
+-	mutex_unlock(&acomp_ctx->mutex);
++	return 0;
++}
+ 
+-	/* populate entry */
+-	entry->swpentry = swp_entry(type, offset);
+-	entry->handle = handle;
+-	entry->length = dlen;
++static int zswap_log_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, zswap_log_show, NULL);
++}
++static const struct file_operations zswap_log_fops = {
++	.owner		= THIS_MODULE,
++	.open		= zswap_log_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
+ 
+-insert_entry:
+-	entry->objcg = objcg;
+-	if (objcg) {
+-		obj_cgroup_charge_zswap(objcg, entry->length);
+-		/* Account before objcg ref is moved to tree */
+-		count_objcg_event(objcg, ZSWPOUT);
+-	}
++static void zswap_log_clear(void) {
++	int i;
+ 
+-	/* map */
+-	spin_lock(&tree->lock);
+-	/*
+-	 * A duplicate entry should have been removed at the beginning of this
+-	 * function. Since the swap entry should be pinned, if a duplicate is
+-	 * found again here it means that something went wrong in the swap
+-	 * cache.
+-	 */
+-	while (zswap_rb_insert(&tree->rbroot, entry, &dupentry) == -EEXIST) {
+-		WARN_ON(1);
+-		zswap_duplicate_entry++;
+-		zswap_invalidate_entry(tree, dupentry);
+-	}
+-	if (entry->length) {
+-		INIT_LIST_HEAD(&entry->lru);
+-		zswap_lru_add(&entry->pool->list_lru, entry);
+-		atomic_inc(&entry->pool->nr_stored);
++	for (i = 0; i < ZSWAP_LOG_CAPACITY; i++) {
++		zswap_log_buff[i].cycles_score = 0;
++		zswap_log_buff[i].cycles_comp = 0;
++		zswap_log_buff[i].comp_len = 0;
++		zswap_log_buff[i].comp_score = 0;
++		zswap_log_buff[i].creator_pid = 0;
++		zswap_log_buff[i].algo = 0;
+ 	}
+-	spin_unlock(&tree->lock);
+ 
+-	/* update stats */
+-	atomic_inc(&zswap_stored_pages);
+-	zswap_update_total_size();
+-	count_vm_event(ZSWPOUT);
+-
+-	return true;
+-
+-put_dstmem:
+-	mutex_unlock(&acomp_ctx->mutex);
+-put_pool:
+-	zswap_pool_put(entry->pool);
+-freepage:
+-	zswap_entry_cache_free(entry);
+-reject:
+-	if (objcg)
+-		obj_cgroup_put(objcg);
+-	return false;
++	atomic_set(&zswap_log_index, 0);
++}
+ 
+-shrink:
+-	pool = zswap_pool_last_get();
+-	if (pool && !queue_work(shrink_wq, &pool->shrink_work))
+-		zswap_pool_put(pool);
+-	goto reject;
++static ssize_t zswap_log_clear_write(struct file *file, const char __user *buf,
++					size_t count, loff_t *ppos)
++{
++	zswap_log_clear();
++	return count;
+ }
+ 
++static const struct file_operations zswap_log_clear_fops = {
++	.owner		= THIS_MODULE,
++	.write		= zswap_log_clear_write,
++};
++
+ bool zswap_load(struct folio *folio)
+ {
+ 	swp_entry_t swp = folio->swap;
+@@ -1858,6 +2009,10 @@ static int zswap_debugfs_init(void)
+ 			   zswap_debugfs_root, &zswap_pool_total_size);
+ 	debugfs_create_atomic_t("stored_pages", 0444,
+ 				zswap_debugfs_root, &zswap_stored_pages);
++	debugfs_create_file("compression_log", 0444,
++			    zswap_debugfs_root, NULL, &zswap_log_fops);
++	debugfs_create_file("compression_log_clear", 0200,
++			    zswap_debugfs_root, NULL, &zswap_log_clear_fops);
+ 	debugfs_create_atomic_t("same_filled_pages", 0444,
+ 				zswap_debugfs_root, &zswap_same_filled_pages);
+ 
